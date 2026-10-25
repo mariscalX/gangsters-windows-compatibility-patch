@@ -1,0 +1,153 @@
+diff --git a/src/patches.c b/src/patches.c
+index a3cc56d..ddafcaa 100644
+--- a/src/patches.c
++++ b/src/patches.c
+@@ -80,7 +80,11 @@ static VOID CALLBACK cd_dump_tick(HWND w, UINT m, UINT_PTR id, DWORD now) {
+ }
+ void patches_debug_cd_dump(int on) { if (on) SetTimer(NULL, 0, 4000, cd_dump_tick); }
+ 
++void apply_mouse_alignment_patch(void);
++void apply_mouse_poll_patch(void);
+ void apply_exe_patches(void) {
++    apply_mouse_poll_patch();
++    apply_mouse_alignment_patch();
+     if ((DWORD_PTR)GetModuleHandleA(NULL) != EXE_BASE) {
+         shim_log("exe not at expected base, skipping binary patches");
+         return;
+@@ -107,3 +111,77 @@ void apply_exe_patches(void) {
+         patch(0x64386e, expect, repl, 6, "button painter TextOutA (labels are drawn by the overlay)");
+     }
+ }
++
++/* Align the legacy relative cursor with the real client position. The original
++ * accumulates DirectInput deltas * 2, independently from the Windows pointer. */
++extern HWND window_fix_game_root(void);
++extern void *goc_real_user32(const char *name);
++void sync_game_mouse(void *object, LONG *mouse_state) {
++    HWND top = window_fix_game_root();
++    if(!top || !IsWindow(top)) top=GetActiveWindow();
++    if (top) top = GetAncestor(top, GA_ROOT);
++    WINDOWINFO wi = {sizeof wi}; POINT p;
++    static BOOL (WINAPI *cursor_pos)(LPPOINT);
++    if(!cursor_pos) cursor_pos=(void *)goc_real_user32("GetCursorPos");
++    if (!top || !cursor_pos || !GetWindowInfo(top, &wi) || !cursor_pos(&p)) return;
++    int rw=wi.rcClient.right-wi.rcClient.left, rh=wi.rcClient.bottom-wi.rcClient.top;
++    if(rw<=0 || rh<=0) return;
++    LONG *x=(LONG *)((BYTE *)object+0xa38), *y=(LONG *)((BYTE *)object+0xa3c);
++    LONG xmin=*(LONG *)((BYTE *)object+0xa48), xmax=*(LONG *)((BYTE *)object+0xa4c);
++    LONG ymin=*(LONG *)((BYTE *)object+0xa50), ymax=*(LONG *)((BYTE *)object+0xa54);
++    if(xmax<xmin || ymax<ymin || xmax-xmin>16384 || ymax-ymin>16384) return;
++    *x=xmin+MulDiv(p.x-wi.rcClient.left,xmax-xmin+1,rw);
++    *y=ymin+MulDiv(p.y-wi.rcClient.top,ymax-ymin+1,rh);
++    if(*x<xmin)*x=xmin; if(*x>xmax)*x=xmax;
++    if(*y<ymin)*y=ymin; if(*y>ymax)*y=ymax;
++    static int last_buttons=-1; int buttons=((BYTE *)mouse_state)[12];
++    if(buttons!=last_buttons){shim_log("mouse state x=%ld y=%ld left=%d",*x,*y,buttons);last_buttons=buttons;}
++    mouse_state[0]=mouse_state[1]=0;
++}
++__asm__(
++    ".globl _mouse_sync_stub\n"
++    "_mouse_sync_stub:\n"
++    "  pushfl\n"
++    "  pushal\n"
++    "  leal 48(%esp), %eax\n"
++    "  pushl %eax\n"
++    "  pushl %esi\n"
++    "  call _sync_game_mouse\n"
++    "  addl $8, %esp\n"
++    "  popal\n"
++    "  popfl\n"
++    "  movl 12(%esp), %ecx\n"
++    "  movl 0xa38(%esi), %eax\n"
++    "  pushl $0x7657ae\n"
++    "  ret\n");
++extern char mouse_sync_stub[];
++void apply_mouse_alignment_patch(void) {
++    if((DWORD_PTR)GetModuleHandleA(NULL)!=EXE_BASE)return;
++    static const BYTE expect[10]={0x8b,0x4c,0x24,0x0c,0x8b,0x86,0x38,0x0a,0x00,0x00};
++    BYTE repl[10]={0xe9,0,0,0,0,0x90,0x90,0x90,0x90,0x90};
++    DWORD rel=(DWORD)(DWORD_PTR)mouse_sync_stub-(0x7657a4+5);
++    memcpy(repl+1,&rel,4);
++    patch(0x7657a4,expect,repl,10,"absolute client mouse alignment");
++}
++
++/* Polling very short clicks must not lose an entire command. Keep native
++ * device data when available and recover button transitions from Win32. */
++HRESULT WINAPI compat_mouse_state(void *device, DWORD size, void *data) {
++    typedef HRESULT (WINAPI *Poll)(void *,DWORD,void *);
++    HRESULT hr=((Poll)((void **)(*(void ***)device))[9])(device,size,data);
++    if(size<16 || !data)return hr;
++    if(hr<0)memset(data,0,size);
++    BYTE *b=(BYTE *)data;
++    SHORT left=GetAsyncKeyState(VK_LBUTTON), right=GetAsyncKeyState(VK_RBUTTON), middle=GetAsyncKeyState(VK_MBUTTON);
++    b[12]=(left & 0x8001)?128:0;
++    b[13]=(right & 0x8001)?128:0;
++    b[14]=(middle & 0x8001)?128:0;
++    return 0;
++}
++void apply_mouse_poll_patch(void) {
++    static const BYTE expect[5]={0x8b,0x1f,0xff,0x53,0x24};
++    BYTE repl[5]={0xe8,0,0,0,0};
++    DWORD rel=(DWORD)(DWORD_PTR)compat_mouse_state-(0x765773+5);
++    memcpy(repl+1,&rel,4);
++    patch(0x765773,expect,repl,5,"mouse button polling compatibility");
++}
+diff --git a/src/window_fix.c b/src/window_fix.c
+index 863cd4e..256618f 100644
+--- a/src/window_fix.c
++++ b/src/window_fix.c
+@@ -1,4 +1,4 @@
+-﻿/*
++/*
+  * Child-window scaling for Gangsters' native menu controls.
+  *
+  * Background: the game's menus use real Win32 child controls (owner-drawn BUTTONs, STATICs) positioned in *game*
+@@ -52,7 +52,7 @@ static int get_map(HWND w, Map *m) {
+     if (!real_GetClientRect(top, &lr)) return 0;   /* cnc-ddraw reports the game's logical size here */
+     int lw = lr.right, lh = lr.bottom;
+     if (lw <= 0 || lh <= 0 || rw <= 0 || rh <= 0) return 0;
+-    if (lw == rw && lh == rh) return 0;
++    /* Keep identity mapping active for label rendering at native size. */
+     m->sx = (double)rw / lw;
+     m->sy = (double)rh / lh;
+     if (g_maintain_ar) m->sx = m->sy = (m->sx < m->sy ? m->sx : m->sy);
+@@ -656,14 +656,30 @@ BOOL WINAPI fix_GetWindowRect_game_space(HWND hwnd, LPRECT r) {
+     HWND parent = hwnd ? GetParent(hwnd) : NULL;
+     if (ok && g_enabled && parent && (GetWindowLongA(hwnd, GWL_STYLE) & WS_CHILD) && get_child_map(parent, &m))
+         to_design_rect(hwnd, parent, &m, r);
++    /* Surface coordinates start at zero even in a moved bordered window. */
++    if (ok && parent) {
++        WINDOWINFO wi = {sizeof wi};
++        if (GetWindowInfo(GetAncestor(parent, GA_ROOT), &wi))
++            OffsetRect(r, -wi.rcClient.left, -wi.rcClient.top);
++    }
+     return ok;
+ }
+ 
++/* Resolve genuine user32 exports without cnc-ddraw's GetProcAddress remapping. */
++void *goc_real_user32(const char *name) {
++    typedef struct { USHORT Length, MaximumLength; char *Buffer; } NativeAnsi;
++    typedef LONG (WINAPI *Resolve)(HMODULE, NativeAnsi *, ULONG, void **);
++    Resolve resolve=(Resolve)GetProcAddress(GetModuleHandleA("ntdll.dll"),"LdrGetProcedureAddress");
++    NativeAnsi a={(USHORT)strlen(name),(USHORT)(strlen(name)+1),(char *)name};
++    void *p=NULL;
++    if(resolve) resolve(GetModuleHandleA("user32.dll"),&a,0,&p);
++    return p;
++}
+ void window_fix_install(void) {
+     HMODULE u = GetModuleHandleA("user32.dll");
+-    real_SetWindowPos = (void *)GetProcAddress(u, "SetWindowPos");
+-    real_GetClientRect = (void *)GetProcAddress(u, "GetClientRect");
+-    real_GetWindowRect = (void *)GetProcAddress(u, "GetWindowRect");
++    real_SetWindowPos = (void *)goc_real_user32("SetWindowPos");
++    real_GetClientRect = (void *)goc_real_user32("GetClientRect");
++    real_GetWindowRect = (void *)goc_real_user32("GetWindowRect");
+     DWORD tid = GetCurrentThreadId();
+     g_cbt = SetWindowsHookExA(WH_CBT, cbt_proc, NULL, tid);
+     g_ret = SetWindowsHookExA(WH_CALLWNDPROCRET, ret_proc, NULL, tid);
+@@ -672,3 +688,5 @@ void window_fix_install(void) {
+ }
+ 
+ 
++
++HWND window_fix_game_root(void) { return g_game_root; }
