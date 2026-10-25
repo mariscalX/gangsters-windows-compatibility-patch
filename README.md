@@ -1,10 +1,10 @@
 # Gangsters: Organized Crime - Windows Compatibility Patch
 
-Experimental version 0.1 - October 25, 2026
+Version 0.1 - October 25, 2026
 
 ## About
 
-An experimental adaptation of the community goc_compatability v0.2.0 patch:
+An adaptation of the community goc_compatability v0.2.0 patch:
 https://github.com/xsixbulletsx/goc_compatability
 
 Additional credits: cnc-ddraw and miniaudio. Their notices are included.
@@ -25,16 +25,26 @@ Requires your own GOG copy of Gangsters: Organized Crime.
 - Windows button-state polling helps recover short clicks.
 - A bordered-window configuration is included; fullscreen is not forced.
 
-## Testing and limitations
+## Verified operation
 
-Tested on one Windows 11 PC with a GOG executable matching this SHA256:
+The following checks passed on Windows 11 with the GOG version:
+
+- Start the game and create a new game without the previous crash.
+- Read and use windowed menu buttons.
+- Use the aligned in-game cursor and mouse clicks.
+- Save a new game to slot 001 and load it from within the game.
+- Start the working week and run the populated city with pedestrians and vehicles.
+- Accelerate time and complete the working week, returning to the organizer.
+- Create a second manual save after the weekly transition; the weekly autosave also appeared.
+- Close the game normally using the window close button and launch it again.
+- Load the second save from the initial menu and verify that Week 2 was restored.
+
+Tested executable SHA256:
 78C66B2EEA09A4945FE29CA0F7EE19B936E3D9E9CB32D2EC4349ABE39DD4DB71
 
-New Game, initial game loading, the newspaper and city map were observed working.
-The user confirmed that the cursor was aligned and clicks worked.
-
-Saving/loading, extended sessions, multiplayer, all resolutions, other GPUs and
-other PCs have NOT been validated. This is not a universally tested stable release.
+The test covers the included bordered-window profile, a 1024x768 in-game resolution,
+and one Windows 11 PC. It does not establish multiplayer or other hardware coverage.
+See TESTING.md for the reproducible test record.
 
 No economy, recruitment, combat or diplomacy rules are changed.
 The game executable remains unchanged on disk; code fixes are applied in memory.
@@ -61,4 +71,5 @@ from this package. Do not delete gangsters.exe, game data or saved games.
 The source folder contains the two modified files and changes.patch against the
 community project. Compilation uses that project's build.ps1 and Zig.
 The original game's code, graphics, music and saved games are NOT included.
-The experimental DLL is not digitally signed.
+The patch DLL is not digitally signed.
+
