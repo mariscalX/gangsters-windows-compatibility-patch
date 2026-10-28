@@ -1,6 +1,20 @@
 # Gangsters: Organized Crime - Windows Compatibility Patch
 
-Version 0.1 - October 25, 2026
+Version 0.2 - October 28, 2026
+
+## New in 0.2
+
+- Recompute menu-control placement and label rendering after window resizing.
+- Map the pointer to the actual 4:3 game viewport, including letterboxed windows.
+- Synchronize both mouse polling paths with the actual window viewport.
+- Remove the legacy 630/470 cursor wrapping from the drag anchor. At 1024x768, it could repeatedly pan the map while the pointer barely moved. This applies to the organizer map and the working-week map.
+- Stop interpreting a pointer outside the game viewport as an edge-scroll command.
+- Preserve the height of saved-game lists when fonts are repeatedly set in enlarged windows.
+- Cap presentation at 60 FPS in the supplied windowed profile.
+
+This is a compatibility-only build. It contains no F8 cheat panel, trainer,
+recruitment changes, money tools, loyalty edits, police modifications or squad automation.
+F8 retains the original game's behavior. Existing gameplay rules and save files are not edited.
 
 ## About
 
@@ -27,7 +41,8 @@ Requires your own GOG copy of Gangsters: Organized Crime.
 
 ## Verified operation
 
-The following checks passed on Windows 11 with the GOG version:
+The original v0.1 checks below passed on Windows 11 with the GOG version.
+The separate v0.2 checks and exact DLL hash are recorded in TESTING.md:
 
 - Start the game and create a new game without the previous crash.
 - Read and use windowed menu buttons.
@@ -68,8 +83,21 @@ from this package. Do not delete gangsters.exe, game data or saved games.
 
 ## Source
 
-The source folder contains the two modified files and changes.patch against the
-community project. Compilation uses that project's build.ps1 and Zig.
+The source folder contains the modified compatibility files and a viewport test.
+Build with `./build.ps1 -UpstreamDir <goc_compatability-directory>` after preparing
+the community project's Zig environment and dependencies. The build uses an explicit
+source list containing no trainer modules. `source/changes.patch` documents the original
+v0.1 changes; the current C files are authoritative for v0.2.
 The original game's code, graphics, music and saved games are NOT included.
 The patch DLL is not digitally signed.
 
+
+## Navigation
+
+Hold the right mouse button and move the pointer to pan. Release and repeat when
+you reach the window boundary. This patch removes cursor wrapping; it does not
+add an edge-scrolling mode or change the game rules.
+
+Resizing an already-open main menu can leave stale button artwork behind until
+you enter another menu. The labels remain readable and clickable. This cosmetic
+repaint limitation is not a claim of fullscreen or multi-monitor coverage.

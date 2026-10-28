@@ -116,6 +116,12 @@ void apply_exe_patches(void) {
  * accumulates DirectInput deltas * 2, independently from the Windows pointer. */
 extern HWND window_fix_game_root(void);
 extern void *goc_real_user32(const char *name);
+#include "viewport_math.h"
+/* Disable the native 630/470 cursor wrap with absolute window coordinates. */
+static void __attribute__((thiscall)) absolute_drag_anchor(void *object, int x, int y) {
+    *(int *)((BYTE *)object+0x98)=x;
+    *(int *)((BYTE *)object+0x9c)=y;
+}
 void sync_game_mouse(void *object, LONG *mouse_state) {
     HWND top = window_fix_game_root();
     if(!top || !IsWindow(top)) top=GetActiveWindow();
@@ -130,8 +136,15 @@ void sync_game_mouse(void *object, LONG *mouse_state) {
     LONG xmin=*(LONG *)((BYTE *)object+0xa48), xmax=*(LONG *)((BYTE *)object+0xa4c);
     LONG ymin=*(LONG *)((BYTE *)object+0xa50), ymax=*(LONG *)((BYTE *)object+0xa54);
     if(xmax<xmin || ymax<ymin || xmax-xmin>16384 || ymax-ymin>16384) return;
-    *x=xmin+MulDiv(p.x-wi.rcClient.left,xmax-xmin+1,rw);
-    *y=ymin+MulDiv(p.y-wi.rcClient.top,ymax-ymin+1,rh);
+    int vx,vy;
+    int inside=viewport_point(rw,rh,xmax-xmin+1,ymax-ymin+1,
+                             p.x-wi.rcClient.left,p.y-wi.rcClient.top,&vx,&vy);
+    if(inside){*x=xmin+vx;*y=ymin+vy;}
+    else {
+        /* Never pin an outside desktop pointer to an edge: that scrolls forever. */
+        *x=xmin+(xmax-xmin)/2;*y=ymin+(ymax-ymin)/2;
+        memset((BYTE *)mouse_state+12,0,4);
+    }
     if(*x<xmin)*x=xmin; if(*x>xmax)*x=xmax;
     if(*y<ymin)*y=ymin; if(*y>ymax)*y=ymax;
     static int last_buttons=-1; int buttons=((BYTE *)mouse_state)[12];
@@ -155,13 +168,42 @@ __asm__(
     "  pushl $0x7657ae\n"
     "  ret\n");
 extern char mouse_sync_stub[];
+/* The message-loop poll (765550) also accumulates relative deltas. It runs
+ * between the command polls above; leaving it native makes the cursor/map jump. */
+__asm__(
+    ".globl _mouse_poll_sync_stub\n"
+    "_mouse_poll_sync_stub:\n"
+    "  pushfl\n"
+    "  pushal\n"
+    "  leal 52(%esp), %eax\n"
+    "  pushl %eax\n"
+    "  pushl %ebx\n"
+    "  call _sync_game_mouse\n"
+    "  addl $8, %esp\n"
+    "  popal\n"
+    "  popfl\n"
+    "  movl 16(%esp), %eax\n"
+    "  movl 0xa38(%ebx), %ecx\n"
+    "  pushl $0x7655a0\n"
+    "  ret\n");
+extern char mouse_poll_sync_stub[];
 void apply_mouse_alignment_patch(void) {
     if((DWORD_PTR)GetModuleHandleA(NULL)!=EXE_BASE)return;
+    static const BYTE wrap_expect[5]={0xe9,0xde,0x1e,0x33,0x0};
+    BYTE wrap_repl[5]={0xe9,0,0,0,0};
+    DWORD wrap_rel=(DWORD)(DWORD_PTR)absolute_drag_anchor-(0x4048bd+5);
+    memcpy(wrap_repl+1,&wrap_rel,4);
+    patch(0x4048bd,wrap_expect,wrap_repl,5,"absolute drag anchor without legacy wrap");
     static const BYTE expect[10]={0x8b,0x4c,0x24,0x0c,0x8b,0x86,0x38,0x0a,0x00,0x00};
     BYTE repl[10]={0xe9,0,0,0,0,0x90,0x90,0x90,0x90,0x90};
     DWORD rel=(DWORD)(DWORD_PTR)mouse_sync_stub-(0x7657a4+5);
     memcpy(repl+1,&rel,4);
     patch(0x7657a4,expect,repl,10,"absolute client mouse alignment");
+    static const BYTE poll_expect[10]={0x8b,0x44,0x24,0x10,0x8b,0x8b,0x38,0x0a,0x00,0x00};
+    BYTE poll_repl[10]={0xe9,0,0,0,0,0x90,0x90,0x90,0x90,0x90};
+    rel=(DWORD)(DWORD_PTR)mouse_poll_sync_stub-(0x765596+5);
+    memcpy(poll_repl+1,&rel,4);
+    patch(0x765596,poll_expect,poll_repl,10,"absolute message-loop mouse alignment");
 }
 
 /* Polling very short clicks must not lose an entire command. Keep native
@@ -185,3 +227,4 @@ void apply_mouse_poll_patch(void) {
     memcpy(repl+1,&rel,4);
     patch(0x765773,expect,repl,5,"mouse button polling compatibility");
 }
+

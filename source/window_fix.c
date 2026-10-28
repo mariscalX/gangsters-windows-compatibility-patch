@@ -49,7 +49,10 @@ static int get_map(HWND w, Map *m) {
     if (!GetWindowInfo(top, &wi)) return 0;
     int rw = wi.rcClient.right - wi.rcClient.left, rh = wi.rcClient.bottom - wi.rcClient.top;
     RECT lr;
-    if (!real_GetClientRect(top, &lr)) return 0;   /* cnc-ddraw reports the game's logical size here */
+    /* Resolve through cnc-ddraw's remapping here, not genuine user32: the
+     * genuine API reports physical pixels and would make every scale equal 1. */
+    BOOL (WINAPI *logical_rect)(HWND,LPRECT)=(void *)GetProcAddress(GetModuleHandleA("user32.dll"),"GetClientRect");
+    if (!logical_rect || !logical_rect(top, &lr)) return 0;
     int lw = lr.right, lh = lr.bottom;
     if (lw <= 0 || lh <= 0 || rw <= 0 || rh <= 0) return 0;
     /* Keep identity mapping active for label rendering at native size. */
@@ -288,12 +291,14 @@ static BOOL CALLBACK repaint_child(HWND h, LPARAM lp) {
 }
 
 static void flush_pending_statics(void);
+static void resize_existing_controls(void);
 
 static VOID CALLBACK repaint_tick(HWND unused, UINT msg, UINT_PTR id, DWORD now) {
     (void)unused; (void)msg; (void)id; (void)now;
     static int busy;
     if (busy) return;
     busy = 1;
+    resize_existing_controls();
     flush_pending_statics();
     sync_overlays();
     if (!g_game_root || !IsWindow(g_game_root)) { busy = 0; return; }
@@ -338,7 +343,7 @@ static int is_scalable_text_class(const char *cls) {
            !lstrcmpiA(cls, "COMBOBOX") || !lstrcmpiA(cls, "BUTTON") || !lstrcmpiA(cls, "SCROLLBAR");
 }
 
-typedef struct { HWND h; HFONT scaled; } FontMap;
+typedef struct { HWND h; HFONT scaled; int listHeight; } FontMap;
 static FontMap g_fontmap[256];
 
 static HFONT mapped_font(HWND h) {
@@ -354,6 +359,7 @@ static void scale_control_font(HWND h, HFONT src, int from_setfont) {
     if (g_in_setfont || !parent || !(GetWindowLongA(h, GWL_STYLE) & WS_CHILD)) return;
     GetClassNameA(h, cls, sizeof cls);
     if (!is_scalable_text_class(cls) || is_owner_draw_button(h, cls)) return;
+    if (!lstrcmpiA(cls,"LISTBOX")) SetWindowLongA(h,GWL_STYLE,GetWindowLongA(h,GWL_STYLE)|LBS_NOINTEGRALHEIGHT);
     if (!get_child_map(parent, &m)) return;
     HFONT cur = from_setfont ? src : (HFONT)SendMessageA(h, WM_GETFONT, 0, 0);
     if (cur && is_our_font(cur)) return;
@@ -364,11 +370,62 @@ static void scale_control_font(HWND h, HFONT src, int from_setfont) {
         if (g_fontmap[i].h == h) { slot = i; break; }
         if (slot < 0 && !g_fontmap[i].h) slot = i;
     }
-    if (slot >= 0) { g_fontmap[slot].h = h; g_fontmap[slot].scaled = f; }
+    if (slot >= 0) {
+        if (g_fontmap[slot].h != h) {g_fontmap[slot].listHeight=0;}
+        g_fontmap[slot].h = h; g_fontmap[slot].scaled = f;
+        if (!lstrcmpiA(cls,"LISTBOX") && !g_fontmap[slot].listHeight) {
+            RECT q; real_GetWindowRect(h,&q); g_fontmap[slot].listHeight=q.bottom-q.top;
+        }
+    }
     g_in_setfont = 1;
     SendMessageA(h, WM_SETFONT, (WPARAM)f, TRUE);
     g_in_setfont = 0;
+    if(slot>=0 && g_fontmap[slot].listHeight>0) {
+        RECT q; real_GetWindowRect(h,&q);
+        real_SetWindowPos(h,NULL,0,0,q.right-q.left,g_fontmap[slot].listHeight,SWP_NOMOVE|SWP_NOZORDER|SWP_NOACTIVATE);
+    }
     if (g_verbose) shim_log("scaled font of %s control %p (x%.2f)", cls, (void *)h, m.sy);
+}
+
+/* A maximization changes the physical client without recreating native controls.
+ * Reproject existing rectangles once, from the previous viewport into the new one.
+ * Use genuine user32 to avoid applying our creation/SetWindowPos scale twice. */
+typedef struct { Map oldmap,newmap; HWND root; } ResizeContext;
+static BOOL CALLBACK resize_child(HWND h,LPARAM data){
+ ResizeContext *c=(ResizeContext *)data;
+ HWND parent=GetParent(h);
+ if(!parent||!(GetWindowLongA(h,GWL_STYLE)&WS_CHILD))return TRUE;
+ RECT r,pr; if(!real_GetWindowRect(h,&r))return TRUE;
+ WINDOWINFO wi={sizeof wi};
+ if(parent==c->root){if(!GetWindowInfo(c->root,&wi))return TRUE;pr=wi.rcClient;}
+ else if(!real_GetWindowRect(parent,&pr))return TRUE;
+ double aox=parent==c->root?c->oldmap.ox:0,aoy=parent==c->root?c->oldmap.oy:0;
+ double box=parent==c->root?c->newmap.ox:0,boy=parent==c->root?c->newmap.oy:0;
+ int x=(int)(((r.left-pr.left-aox)/c->oldmap.sx)*c->newmap.sx+box+0.5);
+ int y=(int)(((r.top-pr.top-aoy)/c->oldmap.sy)*c->newmap.sy+boy+0.5);
+ int w=(int)((r.right-r.left)*c->newmap.sx/c->oldmap.sx+0.5);
+ int ht=(int)((r.bottom-r.top)*c->newmap.sy/c->oldmap.sy+0.5);
+ real_SetWindowPos(h,NULL,x,y,w,ht,SWP_NOACTIVATE|SWP_NOZORDER);
+ char cls[32]="";GetClassNameA(h,cls,sizeof cls);
+ if(is_scalable_text_class(cls)&&!is_owner_draw_button(h,cls)){
+  HFONT cur=(HFONT)SendMessageA(h,WM_GETFONT,0,0);
+  HFONT f=scaled_font_from(cur,c->newmap.sy/c->oldmap.sy);
+  if(f){g_in_setfont=1;SendMessageA(h,WM_SETFONT,(WPARAM)f,TRUE);g_in_setfont=0;
+   for(int i=0;i<256;i++)if(g_fontmap[i].h==h){g_fontmap[i].scaled=f;if(g_fontmap[i].listHeight)g_fontmap[i].listHeight=ht;}
+  }
+ }
+ return TRUE;
+}
+static void resize_existing_controls(void){
+ static HWND previous_root;static Map previous;Map current;
+ if(!g_game_root||!IsWindow(g_game_root)||IsIconic(g_game_root)||!get_map(g_game_root,&current))return;
+ if(previous_root==g_game_root&&previous.sx>0&&previous.sy>0&&
+    (previous.sx!=current.sx||previous.sy!=current.sy||previous.ox!=current.ox||previous.oy!=current.oy)){
+  ResizeContext c={previous,current,g_game_root};
+  g_in_swp=1;EnumChildWindows(g_game_root,resize_child,(LPARAM)&c);g_in_swp=0;
+  shim_log("UI resize scale %.3f -> %.3f, offset %d,%d",previous.sx,current.sx,current.ox,current.oy);
+ }
+ previous=current;previous_root=g_game_root;
 }
 
 /*
@@ -514,6 +571,13 @@ static LRESULT CALLBACK cbt_proc(int code, WPARAM wp, LPARAM lp) {
     if (code == HCBT_CREATEWND && g_enabled) {
         CBT_CREATEWNDA *cw = (CBT_CREATEWNDA *)lp;
         CREATESTRUCTA *cs = cw->lpcs;
+        /* A scaled font repeatedly rounds an integral-height list downward when
+         * the game resets its font. Preserve its requested physical height. */
+        if ((ULONG_PTR)cs->lpszClass >= 0x10000 && !lstrcmpiA(cs->lpszClass,"LISTBOX"))
+            cs->style |= LBS_NOINTEGRALHEIGHT;
+        char owner_class[40] = "";
+        if (cs->hwndParent) GetClassNameA(cs->hwndParent, owner_class, sizeof owner_class);
+        if (!strcmp(owner_class, "GocCheatPanel")) return CallNextHookEx(g_cbt, code, wp, lp);
         if ((cs->style & WS_CHILD) && cs->hwndParent) {
             Map m;
             if (get_child_map(cs->hwndParent, &m)) {
@@ -533,6 +597,12 @@ static LRESULT CALLBACK cbt_proc(int code, WPARAM wp, LPARAM lp) {
 
 /* Runs after a message was handled: turn owner-drawn buttons into self-rendered layered windows. */
 static LRESULT CALLBACK ret_proc(int code, WPARAM wp, LPARAM lp) {
+    if (code == HC_ACTION) {
+        const CWPRETSTRUCT *r = (const CWPRETSTRUCT *)lp;
+        char owner_class[40] = "";
+        GetClassNameA(GetAncestor(r->hwnd, GA_ROOT), owner_class, sizeof owner_class);
+        if (!strcmp(owner_class, "GocCheatPanel")) return CallNextHookEx(g_ret, code, wp, lp);
+    }
     if (code == HC_ACTION && g_enabled && g_render_labels) {
         const CWPRETSTRUCT *r = (const CWPRETSTRUCT *)lp;
         if (g_verbose && (r->message == WM_CTLCOLORSTATIC || r->message == WM_ERASEBKGND || r->message == WM_PAINT)) {
@@ -545,6 +615,9 @@ static LRESULT CALLBACK ret_proc(int code, WPARAM wp, LPARAM lp) {
         }
         if (r->message == WM_CTLCOLORSTATIC) note_static_colour(r->hwnd, (HDC)r->wParam, (HWND)r->lParam);
         switch (r->message) {
+        case WM_NCDESTROY:
+            for(int i=0;i<256;i++) if(g_fontmap[i].h==r->hwnd) memset(&g_fontmap[i],0,sizeof g_fontmap[i]);
+            break;
         case WM_CREATE: {
             char cls[32] = "";
             HWND h = r->hwnd;
